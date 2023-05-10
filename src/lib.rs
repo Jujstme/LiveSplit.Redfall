@@ -1,201 +1,210 @@
 #![no_std]
+#![feature(type_alias_impl_trait, const_async_blocks)]
+#![warn(
+    clippy::complexity,
+    clippy::correctness,
+    clippy::perf,
+    clippy::style,
+    clippy::undocumented_unsafe_blocks,
+    rust_2018_idioms
+)]
 
-use asr::{
-    signature::Signature, time::Duration, timer, timer::TimerState,
-    Address, Process, sync
-};
+use asr::{future::{retry, next_tick}, timer, timer::TimerState, watcher::Watcher, Address, Process, time::Duration, signature::Signature, Address64};
 
-#[cfg(all(not(test), target_arch = "wasm32"))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
+
+asr::panic_handler!();
+asr::async_main!(nightly);
+
+
+async fn main() {
+    let settings = Settings::register();
+
+    loop {
+        // Hook to the target process
+        let process = retry(|| PROCESS_NAMES.into_iter().find_map(Process::attach)).await;
+
+        process.until_closes(async {
+            // Once the target has been found and attached to, set up some default watchers
+            let mut watchers = Watchers::default();
+
+            // Perform memory scanning to look for the addresses we need
+            let addresses = retry(|| Addresses::init(&process)).await;
+
+            loop {
+                // Splitting logic. Adapted from OG LiveSplit:
+                // Order of execution
+                // 1. update() will always be run first. There are no conditions on the execution of this action.
+                // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
+                // 3. If reset does not return true, then the split action will be run.
+                // 4. If the timer is currently not running (and not paused), then the start action will be run.
+                update_loop(&process, &addresses, &mut watchers);
+
+                let timer_state = timer::state();
+                if timer_state == TimerState::Running || timer_state == TimerState::Paused {
+                    if let Some(is_loading) = is_loading(&watchers, &settings) {
+                        if is_loading {
+                            timer::pause_game_time()
+                        } else {
+                            timer::resume_game_time()
+                        }
+                    }
+
+                    if let Some(game_time) = game_time(&watchers, &settings) {
+                        timer::set_game_time(game_time)
+                    }
+
+                    if reset(&watchers, &settings) {
+                        timer::reset()
+                    } else if split(&watchers, &settings) {
+                        timer::split()
+                    }
+                }
+
+                if timer::state() == TimerState::NotRunning && start(&watchers, &settings) {
+                    timer::start();
+
+                    if let Some(is_loading) = is_loading(&watchers, &settings) {
+                        if is_loading {
+                            timer::pause_game_time()
+                        } else {
+                            timer::resume_game_time()
+                        }
+                    }
+                }
+
+                next_tick().await;
+            }
+        }).await;
+    }
 }
 
-static AUTOSPLITTER: sync::Mutex<State> = sync::Mutex::new(State {
-    game: None,
-    watchers: Watchers {
-        is_loading: false,
-    },
-    // settings: None,
-});
-
-struct State {
-    game: Option<ProcessInfo>,
-    watchers: Watchers,
-    // settings: Option<Settings>,
-}
-
-struct ProcessInfo {
-    game: Process,
-    addresses: Option<MemoryPtr>,
-}
-
+#[derive(Default)]
 struct Watchers {
-    is_loading: bool,
+    is_loading: Watcher<bool>,
+    player_exp: Watcher<u64>,
+    level: Watcher<Map>,
 }
 
-struct MemoryPtr {
-    g_world: Address,
-}
 
-/*
 #[derive(asr::Settings)]
 struct Settings {
     #[default = true]
     /// AUTO START
     start: bool,
 }
-*/
 
-impl ProcessInfo {
-    fn attach_process() -> Option<Self> {
-        let game = PROCESS_NAMES.iter()
-            .find_map(|m| Process::attach(m))?;
+struct Addresses {
+    g_engine: Address,
+}
+
+impl Addresses {
+    fn init(game: &Process) -> Option<Addresses> {
+        const SIG_GENGINE: Signature<7> = Signature::new("A8 01 75 ?? 48 C7 05");
+
+        let main_module = PROCESS_NAMES.iter()
+            .find_map(|m| game.get_module_range(m).ok())?;
+
+        let ptr = SIG_GENGINE.scan_process_range(game, main_module)?.add(7);
+        let g_engine = ptr.add(8).add_signed(game.read::<i32>(ptr).ok()? as i64);
 
         Some(Self {
-            game,
-            addresses: None,
-        })
-    }
-
-    fn look_for_addresses(&mut self) -> Option<MemoryPtr> {
-        const SIG_GWORLD: Signature<15> = Signature::new("80 7C 24 ?? 00 ?? ?? 48 8B 3D ???????? 48");
-        let game = &self.game;
-
-        let (Ok(main_module_base), Ok(main_module_size)) = PROCESS_NAMES.iter()
-            .map(|m| (game.get_module_address(m), game.get_module_size(m)))
-            .find(|m| m.0.is_ok() && m.1.is_ok())?
-            else {
-                return None
-            };
-
-        let ptr = SIG_GWORLD.scan_process_range(game, main_module_base, main_module_size)?.0 as i64 + 10;
-        let g_world = Address((ptr + 0x4 + game.read::<i32>(Address(ptr as u64)).ok()? as i64) as u64);
-
-        Some(MemoryPtr {
-            g_world,
+            g_engine,
         })
     }
 }
 
-impl State {
-    fn init(&mut self) -> bool {
-        if self.game.is_none() {
-            self.game = ProcessInfo::attach_process()
-        }
+fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
+    let mut is_loading = true;
+    let mut is_coop = bool::default();
+    let mut player_exp = u64::default();
+    let mut current_level = match &watchers.level.pair { Some(x) => x.current, _ => Map::default() };
 
-        let Some(game) = &mut self.game else {
-            return false
-        };
+    if let Ok(g_engine) = game.read::<Address64>(addresses.g_engine) {
+        if let Ok(game_view_port) = game.read::<Address64>(g_engine.add(0x7B8)) {
 
-        if !game.game.is_open() {
-            self.game = None;
-            return false;
-        }
+            // Current map
+            if let Ok(world) = game.read::<Address64>(game_view_port.add(0x78)) {
+                if let Ok(level) = game.read::<Address64>(world.add(0x4B8)) {
+                    if let Ok(map_name) = game.read::<[u16; 100]>(level) {
+                        let map = map_name.map(|n| n as u8);
+                        let map_name = &map[..map.iter().position(|&b| b == 0).unwrap_or(map.len())];
 
-        if game.addresses.is_none() {
-            game.addresses = game.look_for_addresses()
-        }
+                        current_level = match map_name {
+                            b"/Game/Maps/Campaign/FrontEnd/FrontEnd" => Map::MainMenu,
+                            b"/Game/Maps/Campaign/District_01/District_01" => Map::RedfallCommons,
+                            b"/Game/Maps/Campaign/District_02/District_02" => Map::BurialPoint,
+                            _ => current_level,
+                        };
+                    }
+                }
+            }
 
-        game.addresses.is_some()
-    }
+            if let Ok(game_instance) = game.read::<Address64>(game_view_port.add(0x80)) {
+                if current_level != Map::MainMenu {
+                    if let Ok(local_players) = game.read::<Address64>(game_instance.add(0x38)) {
+                        if let Ok(player0) = game.read::<Address64>(local_players) {
+                            if let Ok(player_controller) = game.read::<Address64>(player0.add(0x30)) {
+                                if let Ok(pawn) = game.read::<Address64>(player_controller.add(0x268)) {
+                                    if let Ok(experience) = game.read::<Address64>(pawn.add(0xDC0)) {
+                                        if let Ok(exp) = game.read::<u64>(experience.add(0xE0)) {
+                                                player_exp = exp;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
-    fn update(&mut self) {
-        let Some(game) = &self.game else { return };
-        let Some(addresses) = &game.addresses else { return };
-        let proc = &game.game;
+                if let Ok(ark_net_client_matchmaking) = game.read::<Address64>(game_instance.add(0x8A8)) {
+                    if let Ok(no_of_players) = game.read::<u32>(ark_net_client_matchmaking.add(0x60)) {
+                        is_coop = no_of_players > 0;
+                    }
+                }
 
-
-        let mut is_loading = true;
-
-        if let Ok(g_world) = proc.read::<u64>(addresses.g_world) {
-            if let Ok(owninggameinstance) = proc.read::<u64>(Address(g_world + 0x180)) {
-                if let Ok(load_addr) = proc.read::<u32>(Address(owninggameinstance + 0x560)) {
-                    is_loading = load_addr > 0;
+                if let Ok(load_addr) = game.read::<u32>(game_instance.add(if is_coop { 0x520 } else { 0x560 })) {
+                    is_loading = load_addr != 0;
                 }
             }
         }
-
-        self.watchers.is_loading = is_loading;
     }
 
-    fn start(&mut self) -> bool {
-        false
-    }
-
-    fn split(&mut self) -> bool {
-        false
-    }
-
-    fn reset(&mut self) -> bool {
-        false
-    }
-
-    fn is_loading(&mut self) -> Option<bool> {
-        Some(self.watchers.is_loading)
-    }
-
-    fn game_time(&mut self) -> Option<Duration> {
-        None
-    }
+    watchers.is_loading.update_infallible(is_loading);
+    watchers.level.update_infallible(current_level);
+    watchers.player_exp.update_infallible(player_exp);
 }
 
-#[no_mangle]
-pub extern "C" fn update() {
-    // Get access to the spinlock
-    let autosplitter = &mut AUTOSPLITTER.lock();
+fn start(watchers: &Watchers, settings: &Settings) -> bool {
+    if !settings.start { return false }
+    let Some(is_loading) = &watchers.is_loading.pair else { return false };
+    let Some(level) = &watchers.level.pair else { return false };
+    let Some(player_exp) = &watchers.player_exp.pair else { return false };
 
-    // Sets up the settings
-    // autosplitter.settings.get_or_insert_with(Settings::register);
+    !is_loading.current && is_loading.old && level.current == Map::RedfallCommons && player_exp.current == 0
+}
 
-    // Main autosplitter logic, essentially refactored from the OG LivaSplit autosplitting component.
-    // First of all, the autosplitter needs to check if we managed to attach to the target process,
-    // otherwise there's no need to proceed further.
-    if !autosplitter.init() {
-        return;
-    }
+fn split(_watchers: &Watchers, _settings: &Settings) -> bool {
+    false
+}
 
-    // The main update logic is launched with this
-    autosplitter.update();
+fn reset(_watchers: &Watchers, _settings: &Settings) -> bool {
+    false
+}
 
-    // Splitting logic. Adapted from OG LiveSplit:
-    // Order of execution
-    // 1. update() [this is launched above] will always be run first. There are no conditions on the execution of this action.
-    // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
-    // 3. If reset does not return true, then the split action will be run.
-    // 4. If the timer is currently not running (and not paused), then the start action will be run.
-    let timer_state = timer::state();
-    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
-        if let Some(is_loading) = autosplitter.is_loading() {
-            if is_loading {
-                timer::pause_game_time()
-            } else {
-                timer::resume_game_time()
-            }
-        }
+fn is_loading(watchers: &Watchers, _settings: &Settings) -> Option<bool> {
+    Some(watchers.is_loading.pair?.current)
+}
 
-        if let Some(game_time) = autosplitter.game_time() {
-            timer::set_game_time(game_time)
-        }
+fn game_time(_watchers: &Watchers, _settings: &Settings) -> Option<Duration> {
+    None
+}
 
-        if autosplitter.reset() {
-            timer::reset()
-        } else if autosplitter.split() {
-            timer::split()
-        }
-    }
-
-    if timer::state() == TimerState::NotRunning && autosplitter.start() {
-        timer::start();
-
-        if let Some(is_loading) = autosplitter.is_loading() {
-            if is_loading {
-                timer::pause_game_time()
-            } else {
-                timer::resume_game_time()
-            }
-        }
-    }
+#[derive(Copy, Clone, PartialEq, Default)]
+enum Map {
+    #[default]
+    MainMenu,
+    RedfallCommons,
+    BurialPoint,
 }
 
 const PROCESS_NAMES: [&str; 1] = ["Redfall.exe"];
