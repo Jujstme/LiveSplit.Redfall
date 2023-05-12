@@ -62,6 +62,7 @@ async fn main() {
 
                 if timer::state() == TimerState::NotRunning && start(&watchers, &settings) {
                     timer::start();
+                    timer::pause_game_time();
 
                     if let Some(is_loading) = is_loading(&watchers, &settings) {
                         if is_loading {
