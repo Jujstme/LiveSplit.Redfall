@@ -164,7 +164,7 @@ fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
                 }
 
                 if let Ok(load_addr) = game.read::<u32>(game_instance.add(if is_coop { 0x520 } else { 0x560 })) {
-                    is_loading = load_addr != 0;
+                    is_loading = if is_coop { current_level == Map::MainMenu || load_addr != 0 } else { load_addr != 0 };
                 }
             }
         }
