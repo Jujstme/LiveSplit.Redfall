@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 asr = { git = "https://github.com/LiveSplit/asr", features = ["signature", "derive"] }
+bytemuck = "1.16.0"
 
 [lib]
 crate-type = ["cdylib"]
